@@ -3,199 +3,439 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <filesystem>
+#include <cassert>
+
+
+// TODO Max items count (infinite|excplicitly set)
+
+namespace fs = std::filesystem;
+
 
 namespace m4x1m1l14n
 {
-    namespace details
-    {
-        class FileQueueRecord
-        {
-        public:
-            FileQueueRecord(const std::string& data)
-                : m_data(data)
-            {
+	typedef std::int32_t RecordOffset;
 
-            }
-
-        protected:
-            std::uint32_t m_previousRecordOffset;
-            std::uint32_t m_nextRecordOffset;
-            std::string m_data;
-        };
-
-        class FileQueueHeader
-        {
-        public:
-
-        };
-    }
+	constexpr const RecordOffset ZeroOffset = 0;
+	constexpr std::int32_t RecordOffsetSize = sizeof(RecordOffset);
+	constexpr std::int32_t FileQueueHeaderSize = 0;
+	constexpr std::uint32_t FileListHeaderSize = 1024;
 
 
-    class FileQueue
-    {
-    public:
-        const size_t FileQueueBlockSize = 4096;
+	namespace impl
+	{
+		class FileListHeader
+		{
+		public:
+			FileListHeader()
+			{
 
-    public:
-        FileQueue(const std::string& path)
-            : FileQueue(path, false)
-        {
+			}
 
-        }
+			FileListHeader(const std::string& data)
+			{
 
-        FileQueue(const std::string& path, bool overwrite)
-            : m_path(path)
-            , m_previousRecordOffset(0)
-        {
-            if (path.empty())
-            {
-                throw std::invalid_argument("path cannot be empty!");
-            }
+			}
 
-            auto mode = std::fstream::out | std::fstream::in | std::fstream::binary;
-            mode |= (overwrite) 
-                ? std::fstream::trunc 
-                : std::fstream::app;
+			static FileListHeader Create()
+			{
+				return FileListHeader();
+			}
+		};
 
-            m_file.open(m_path, mode);
-            if (!m_file.is_open())
-            {
-                throw std::runtime_error("Cannot open file \"" + path + "\"");
-            }
-        }
+		class FileListRecord
+		{
+		public:
+			FileListRecord()
+			{
 
-        virtual ~FileQueue()
-        {
-            this->Flush();
-        }
+			}
 
-        void Push(const std::vector<std::string>& data)
-        {
-            for (const auto& x : data)
-            {
-                this->Push(x);
-            }
-        }
+			FileListRecord(const std::unique_ptr<char[]>& buffer, const size_t length)
+			{
+				if (!buffer)
+				{
+					throw std::invalid_argument("buffer cannot be null");
+				}
 
-        void Push(const std::string& data)
-        {
-            const auto& record = details::FileQueueRecord(data);
+				assert(length >= sizeof(RecordOffset));
 
-            const std::uint32_t dataLength = static_cast<std::uint32_t>(data.length());
-            const std::uint32_t recordLength = 
-                static_cast<std::uint32_t>(sizeof(m_previousRecordOffset)) + 
-                static_cast<std::uint32_t>(sizeof(dataLength)) + 
-                dataLength;
+				m_nextRecordOffset = *reinterpret_cast<const RecordOffset*>(buffer.get());
+				// m_previousRecordOffset = *reinterpret_cast<const RecordOffset*>(buffer.c_str() + (buffer.length() - sizeof(RecordOffset)));
 
-            m_file.write(reinterpret_cast<const char*>(&dataLength), sizeof(dataLength));
-            m_file.write(data.c_str(), data.length());
-            m_file.write(reinterpret_cast<const char*>(&m_previousRecordOffset), sizeof(m_previousRecordOffset));
+				m_data = std::string(buffer.get() + sizeof(RecordOffset), length - sizeof(RecordOffset));
+			}
 
-            m_previousRecordOffset += (sizeof(dataLength) + dataLength + sizeof(m_previousRecordOffset));
+			const std::string& Data() const
+			{
+				return m_data;
+			}
 
-            /*std::streamoff pos = m_file.tellp();
-            std::streamoff newpos = pos - dataLength;
+			std::string Data()
+			{
+				return m_data;
+			}
 
-            m_file.seekg(newpos);*/
+		protected:
+			// RecordOffset m_previousRecordOffset;
+			RecordOffset m_nextRecordOffset;
+			std::string m_data;
+		};
 
-            /*const std::uint32_t recordLength = sizeof(std::uint32_t) + sizeof(std::uint32_t) + dataLength;
+		typedef std::shared_ptr<FileListRecord> FileListRecord_ptr;
+	}
 
-            std::uint32_t previousRecordLength = 0;
-            std::uint32_t nextRecordOffset = dataLength;
 
-            std::string record;
+	/**
+	 * File-based double ended queue implementation
+	 */
+	class FileList
+	{
+	public:
+		FileList(const std::string& path)
+			: FileList(path, false)
+		{
 
-            record.reserve(recordLength);
-            record.append(reinterpret_cast<const char*>(&previousRecordLength), sizeof(previousRecordLength));
-            record.append(reinterpret_cast<const char*>(&nextRecordOffset), sizeof(nextRecordOffset));
-            record.append(data.c_str(), data.length());
-            record.append(reinterpret_cast<const char*>(&nextRecordOffset), sizeof(nextRecordOffset));
+		}
 
-            m_file.write(record.c_str(), record.length());*/
-        }
+		FileList(const std::string& path, bool overwrite)
+			: m_length(0)
+		{
+			if (path.empty())
+			{
+				throw std::invalid_argument("'path' cannot be empty!");
+			}
 
-        std::string Pop()
-        {
-            std::streamoff pos = m_file.tellg();
+			const auto exists = fs::exists(path);
+			if (!exists || overwrite)
+			{
+				this->CreateFile(path);
+			}
+			else
+			{
+				this->ReOpenFile(path);
+			}
+		}
 
-            m_file.seekg(pos - 4);
+		virtual ~FileList()
+		{
+			this->Flush();
+		}
 
-            std::uint32_t previousRecordOffset = 0;
+		void PushBack(const std::string& data)
+		{
+			const auto dataLength = static_cast<RecordOffset>(data.length());
 
-            m_file.read(reinterpret_cast<char*>(&previousRecordOffset), sizeof(previousRecordOffset));
+			const auto nextRecordOffset = static_cast<RecordOffset>(sizeof(RecordOffset) + dataLength + sizeof(RecordOffset));
+			const auto previousRecordOffset = -nextRecordOffset;
 
-            std::streamoff previousDataOffset = previousRecordOffset + sizeof(std::uint32_t);
+			m_file.write(reinterpret_cast<const char*>(&nextRecordOffset), sizeof(nextRecordOffset));
+			m_file.write(data.c_str(), data.length());
+			m_file.write(reinterpret_cast<const char*>(&previousRecordOffset), sizeof(previousRecordOffset));
 
-            m_file.seekg(previousDataOffset);
+			++m_length;
+		}
 
-            size_t recordDataLength = pos - previousRecordOffset - 2 * sizeof(std::uint32_t);
+		std::string PopBack()
+		{
+			const auto previousRecordOffset = this->GetPreviousRecordOffset();
+			if (previousRecordOffset == 0)
+			{
+				return std::string();
+			}
 
-            auto buffer = std::make_unique<char[]>(recordDataLength);
+			m_file.seekg(previousRecordOffset, std::ios::cur);
 
-            m_file.read(buffer.get(), recordDataLength);
+			const auto bytesToRead = std::abs(previousRecordOffset) - sizeof(RecordOffset);
 
-            return std::string(buffer.get(), recordDataLength);
-        }
+			auto buffer = std::make_unique<char[]>(bytesToRead);
 
-        std::vector<std::string> Pop(const size_t count)
-        {
-            std::vector<std::string> result;
+			m_file.read(buffer.get(), bytesToRead);
 
-            for (size_t i = 0; i < count; ++i)
-            {
-                const auto& data = this->Pop();
-                if (data.empty())
-                {
-                    break;
-                }
+			const auto bytesRead = m_file.gcount();
 
-                result.push_back(data);
-            }
+			assert(bytesRead == bytesToRead);
 
-            return result;
-        }
+			m_file.seekg(-bytesRead, std::ios::cur);
 
-        void Clear()
-        {
+			m_file.write(reinterpret_cast<const char*>(&ZeroOffset), sizeof(ZeroOffset));
 
-        }
+			m_file.seekg(-RecordOffsetSize, std::ios::cur);
 
-        size_t Size()
-        {
-            const auto backup = m_file.tellg();
-            m_file.seekg(0, m_file.end);
-            const auto size = m_file.tellg();
-            m_file.seekg(backup);
+			--m_length;
 
-            return static_cast<size_t>(size);
-        }
+			const impl::FileListRecord record(buffer, bytesRead);
 
-        size_t Length()
-        {
-            throw std::runtime_error("not implemented");
-        }
+			const auto& result = record.Data();
 
-        void Flush()
-        {
-            m_file.flush();
-        }
+			return result;
+		}
 
-        bool Empty()
-        {
-            return (this->Length() == 0);
-        }
+		void PushFront(const std::string& data)
+		{
+			throw std::runtime_error("not implemented");
+		}
 
-    protected:
-        void PushRecord(const details::FileQueueRecord& record)
-        {
+		std::string PopFront()
+		{
+			throw std::runtime_error("not implemented");
+		}
 
-        }
+		// std::string Front();
+		// std::string Back();
 
-    protected:
-        std::string m_path;
-        std::string m_block;
-        std::uint32_t m_previousRecordOffset;
-        std::uint32_t m_nextRecord;
-        std::fstream m_file;
-    };
+		void Flush()
+		{
+			m_file.flush();
+		}
+
+		void Clear()
+		{
+
+		}
+
+		size_t Size()
+		{
+			const auto position = m_file.tellg();
+			
+			m_file.seekg(0, m_file.end);
+
+			const auto size = m_file.tellg();
+			
+			m_file.seekg(position);
+
+			return static_cast<size_t>(size);
+		}
+
+		size_t Length()
+		{
+			return m_length;
+		}
+
+		bool Empty()
+		{
+			return (this->Length() == 0);
+		}
+
+		virtual void Push(const std::string& data)
+		{
+			throw std::runtime_error("not implemented");
+		}
+
+		void Push(const std::vector<std::string>& data)
+		{
+			for (const auto& x : data)
+			{
+				this->Push(x);
+			}
+		}
+
+		virtual std::string Pop()
+		{
+			throw std::runtime_error("not implemented");
+		}
+
+		std::vector<std::string> Pop(size_t count)
+		{
+			std::vector<std::string> result;
+
+			while (count--)
+			{
+				const auto& data = this->Pop();
+				if (data.empty())
+				{
+					break;
+				}
+
+				result.push_back(data);
+			}
+
+			return result;
+		}
+
+	protected:
+		void CreateFile(const std::string& path)
+		{
+			const auto mode = std::fstream::out | std::fstream::in | std::fstream::binary | std::fstream::trunc;
+
+			m_file.open(path, mode);
+			if (!m_file.is_open())
+			{
+				throw std::runtime_error("Cannot open file \"" + path + "\"");
+			}
+		}
+
+		void ReOpenFile(const std::string& path)
+		{
+			const auto mode = std::fstream::out | std::fstream::in | std::fstream::binary | std::fstream::app;
+
+			m_file.open(path, mode);
+			if (!m_file.is_open())
+			{
+				throw std::runtime_error("Cannot open file \"" + path + "\"");
+			}
+
+			m_header = this->LoadHeader();
+
+			
+		}
+
+		impl::FileListHeader LoadHeader()
+		{
+			const auto position = m_file.tellg();
+			if (position != 0)
+			{
+				m_file.seekg(0);
+			}
+
+			char buffer[FileListHeaderSize];
+
+			m_file.read(buffer, std::size(buffer));
+
+			const auto bytesRead = m_file.gcount();
+			
+			m_file.seekg(position);
+
+			const auto& data = std::string(buffer, bytesRead);
+
+			return impl::FileListHeader(data);
+		}
+
+		void SaveHeader(const impl::FileListHeader& header)
+		{
+			char buffer[FileListHeaderSize] = { 0 };
+
+			const auto position = m_file.tellg();
+			if (position != 0)
+			{
+				m_file.seekg(0);
+			}
+
+			m_file.write(buffer, std::size(buffer));
+
+			const auto bytesWritten = m_file.gcount();
+
+			m_file.seekg(position);
+
+			assert(bytesWritten == std::size(buffer));
+		}
+
+		RecordOffset GetPreviousRecordOffset()
+		{
+			RecordOffset previousRecordOffset = 0;
+
+			const auto position = m_file.tellg();
+			if (position > FileQueueHeaderSize)
+			{
+				const auto offset = static_cast<std::streamoff>(sizeof(RecordOffset));
+
+				m_file.seekg(-offset, std::ios::cur);
+
+				m_file.read(reinterpret_cast<char*>(&previousRecordOffset), sizeof(previousRecordOffset));
+
+				const auto bytesRead = m_file.gcount();
+
+				assert(bytesRead == sizeof(RecordOffset));
+			}
+
+			return previousRecordOffset;
+		}
+
+		impl::FileListRecord_ptr GetPreviousRecord()
+		{
+			return std::make_shared<impl::FileListRecord>();
+		}
+
+		RecordOffset GetNextRecordOffset()
+		{
+			RecordOffset nextRecordOffset = 0;
+
+			const auto position = m_file.tellg();
+
+			return nextRecordOffset;
+		}
+
+	protected:
+		std::fstream m_file;
+		impl::FileListHeader m_header;
+		std::uint64_t m_length;
+	};
+
+	typedef std::shared_ptr<FileList> FileList_ptr;
+
+
+	/**
+	 * LIFO implementation
+	 */
+	class FileStack
+		: public FileList
+	{
+	public:
+		FileStack(const std::string& path)
+			: FileList(path)
+		{
+
+		}
+
+		FileStack(const std::string& path, bool overwrite)
+			: FileList(path, overwrite)
+		{
+
+		}
+
+		virtual ~FileStack()
+		{
+
+		}
+
+		virtual void Push(const std::string& data) override
+		{
+			this->PushBack(data);
+		}
+
+		virtual std::string Pop() override
+		{
+			return this->PopBack();
+		}
+	};
+
+	typedef std::shared_ptr<FileStack> FileStack_ptr;
+
+
+	/**
+	 * FIFO implementation
+	 */
+	class FileQueue
+		: public FileList
+	{
+	public:
+		FileQueue(const std::string& path)
+			: FileList(path)
+		{
+
+		}
+
+		FileQueue(const std::string& path, bool overwrite)
+			: FileList(path, overwrite)
+		{
+
+		}
+
+		virtual ~FileQueue()
+		{
+			
+		}
+
+		virtual void Push(const std::string& data) override
+		{
+			this->PushBack(data);
+		}
+
+		virtual std::string Pop() override
+		{
+			return this->PopFront();
+		}
+	};
+
+	typedef std::shared_ptr<FileQueue> FileQueue_ptr;
 }

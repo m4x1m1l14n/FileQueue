@@ -9,9 +9,12 @@
 
 // add headers that you want to pre-compile here
 #include <iostream>
+#include <filesystem>
 
 #include <FileQueue/FileQueue.hpp>
 
 using namespace m4x1m1l14n;
+
+std::string gen_random(const size_t len);
 
 #endif //PCH_H
